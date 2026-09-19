@@ -1,6 +1,7 @@
 import os
 import io
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from dotenv import load_dotenv
 from google import genai
@@ -10,6 +11,15 @@ from elevenlabs.client import ElevenLabs
 load_dotenv()
 
 app = FastAPI()
+
+# Allow your frontend to call this backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # fine for a hackathon; tighten to your actual frontend URL later if you want
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 eleven_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
