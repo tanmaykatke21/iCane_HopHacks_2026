@@ -38,6 +38,16 @@ let wakeLock = null;
 let isBusy = false;
 let currentAudioUrl = null;
 
+// Surface ANY error directly on-screen instead of failing silently,
+// since we can't easily see the console on a phone.
+window.addEventListener("error", (e) => {
+  statusEl.textContent = "JS ERROR: " + e.message + " (line " + e.lineno + ")";
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const msg = (e.reason && e.reason.message) ? e.reason.message : String(e.reason);
+  statusEl.textContent = "PROMISE ERROR: " + msg;
+});
+
 async function startMonitoring() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
