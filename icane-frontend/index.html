@@ -85,6 +85,14 @@ function stopMonitoring() {
 
 async function captureAndSend() {
   if (isBusy) return;
+
+  // Video metadata (dimensions) can take an extra beat to arrive on iOS.
+  // Skip this tick rather than capturing a 0x0 frame.
+  if (!video.videoWidth || !video.videoHeight) {
+    statusEl.textContent = "Waiting for camera...";
+    return;
+  }
+
   isBusy = true;
   statusEl.textContent = "Capturing...";
 
@@ -95,6 +103,12 @@ async function captureAndSend() {
     canvas.getContext("2d").drawImage(video, 0, 0);
 
     const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
+
+    if (!blob) {
+      statusEl.textContent = "Frame capture failed, retrying...";
+      isBusy = false;
+      return;
+    }
 
     const formData = new FormData();
     formData.append("photo", blob, "frame.jpg");
