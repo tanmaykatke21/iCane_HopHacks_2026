@@ -68,17 +68,20 @@ async function startMonitoring() {
       console.warn("Audio unlock failed:", e);
     }
 
-    try {
-      wakeLock = await navigator.wakeLock.request("screen");
-    } catch (e) {
-      console.warn("Wake Lock not available:", e);
-    }
-
+    // Flip UI + start the loop FIRST. Wake Lock is best-effort and iOS
+    // Safari has a known bug where this promise can hang forever without
+    // ever resolving or rejecting — never let it block startup.
     startBtn.style.display = "none";
     stopBtn.style.display = "inline-block";
     statusEl.textContent = "Monitoring...";
 
     loopTimer = setInterval(captureAndSend, CAPTURE_INTERVAL_MS);
+
+    if (navigator.wakeLock) {
+      navigator.wakeLock.request("screen")
+        .then(lock => { wakeLock = lock; })
+        .catch(e => console.warn("Wake Lock not available:", e));
+    }
   } catch (err) {
     statusEl.textContent = "Camera access failed: " + err.message;
   }
