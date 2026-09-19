@@ -489,9 +489,22 @@ async function startVoiceNavigation() {
     statusEl.textContent = "Start monitoring first.";
     return;
   }
+  // The hazard-detection loop is almost always either mid-request or about
+  // to start again, so bailing out the instant isBusy is true would make
+  // Navigate feel broken far too often for something a blind user can't
+  // just glance at and retry precisely. Wait briefly for a free moment
+  // instead — this only affects navigation's entry point, never the
+  // hazard loop itself.
   if (isBusy) {
-    statusEl.textContent = "Busy, try again in a moment...";
-    return;
+    statusEl.textContent = "Waiting for a clear moment...";
+    const waitStart = Date.now();
+    while (isBusy && Date.now() - waitStart < 3000) {
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (isBusy) {
+      statusEl.textContent = "Busy, try again in a moment...";
+      return;
+    }
   }
 
   let micStream;
