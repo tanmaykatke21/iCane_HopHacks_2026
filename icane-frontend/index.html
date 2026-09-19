@@ -20,6 +20,7 @@
 <button id="startBtn">Start Monitoring</button>
 <button id="stopBtn" style="display:none;">Stop</button>
 <div id="status">Not started</div>
+<audio id="ttsAudio" style="display:none;"></audio>
 
 <script>
 const BACKEND_URL = "https://icane-hophacks-2026.onrender.com/describe";
@@ -29,21 +30,34 @@ const video = document.getElementById("preview");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
+const ttsAudio = document.getElementById("ttsAudio");
 
 let stream = null;
 let loopTimer = null;
 let wakeLock = null;
-let isBusy = false; // prevents overlapping requests
+let isBusy = false;
+let currentAudioUrl = null;
 
 async function startMonitoring() {
   try {
-    // 1. Get camera access (back camera preferred)
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment" }
     });
     video.srcObject = stream;
 
-    // 2. Keep the screen awake
+    // Unlock audio playback for iOS Safari. This MUST happen synchronously
+    // inside this direct click handler (a real user gesture) — Safari then
+    // allows this SAME <audio> element to be played later from timers too.
+    try {
+      ttsAudio.muted = true;
+      await ttsAudio.play();
+      ttsAudio.pause();
+      ttsAudio.currentTime = 0;
+      ttsAudio.muted = false;
+    } catch (e) {
+      console.warn("Audio unlock failed:", e);
+    }
+
     try {
       wakeLock = await navigator.wakeLock.request("screen");
     } catch (e) {
@@ -54,7 +68,6 @@ async function startMonitoring() {
     stopBtn.style.display = "inline-block";
     statusEl.textContent = "Monitoring...";
 
-    // 3. Start the capture loop
     loopTimer = setInterval(captureAndSend, CAPTURE_INTERVAL_MS);
   } catch (err) {
     statusEl.textContent = "Camera access failed: " + err.message;
@@ -71,21 +84,18 @@ function stopMonitoring() {
 }
 
 async function captureAndSend() {
-  if (isBusy) return; // skip this tick if the last request hasn't finished
+  if (isBusy) return;
   isBusy = true;
   statusEl.textContent = "Capturing...";
 
   try {
-    // Draw the current video frame to a canvas
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d").drawImage(video, 0, 0);
 
-    // Convert canvas to a JPEG blob
     const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
 
-    // Send it to the backend
     const formData = new FormData();
     formData.append("photo", blob, "frame.jpg");
 
@@ -93,9 +103,12 @@ async function captureAndSend() {
     if (!response.ok) throw new Error("Backend error: " + response.status);
 
     const audioBlob = await response.blob();
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio(audioUrl);
-    await audio.play();
+
+    if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = URL.createObjectURL(audioBlob);
+
+    ttsAudio.src = currentAudioUrl;
+    await ttsAudio.play();
 
     statusEl.textContent = "Monitoring...";
   } catch (err) {
