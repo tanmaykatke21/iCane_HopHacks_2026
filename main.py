@@ -46,10 +46,14 @@ def classify_image(image_bytes: bytes, prompt: str) -> str:
 
 
 def synthesize_speech(text: str) -> bytes:
+    # eleven_flash_v2_5 trades a little vocal expressiveness for far lower
+    # synthesis latency (sub-100ms model time vs. eleven_v3's much slower,
+    # more expressive generation) — the right tradeoff for a real-time
+    # hazard-warning device where speed matters more than polish.
     audio_chunks = eleven_client.text_to_speech.convert(
         text=text,
         voice_id="JBFqnCBsd6RMkjVDRZzb",
-        model_id="eleven_v3",
+        model_id="eleven_flash_v2_5",
         output_format="mp3_44100_128"
     )
     return b"".join(audio_chunks)
