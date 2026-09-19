@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>Walk-Assist Cane</title>
 <style>
-  body { font-family: -apple-system, sans-serif; text-align: center; background: #111; color: #fff; margin: 0; padding: 20px; }
+  body { font-family: -apple-system, sans-serif; text-align: center; background: #111; color: #fff; margin: 0; padding: 20px; touch-action: manipulation; min-height: 100vh; box-sizing: border-box; }
   video { width: 100%; max-width: 400px; border-radius: 12px; }
   button { font-size: 20px; padding: 16px 32px; margin-top: 20px; margin-right: 8px; border-radius: 12px; border: none; }
   #startBtn { background: #2ecc71; color: white; }
@@ -22,6 +22,7 @@
 <button id="stopBtn" style="display:none;">Stop</button>
 <button id="detailBtn">Describe Surroundings</button>
 <div id="status">Not started</div>
+<div id="hint" style="margin-top: 8px; font-size: 13px; color: #666;">Tap anywhere to start. Once monitoring: shake the phone, or double-tap anywhere, for a full description</div>
 <audio id="ttsAudio" style="display:none;"></audio>
 
 <script>
@@ -67,10 +68,17 @@ let currentAudioUrl = null;
 let lastSpokenText = null;   // the hazard text we last actually spoke, or null when clear/silent
 let consecutiveClearCount = 0;
 
-// A tiny valid (silent) WAV, so priming .play() has an actual source to
-// work with. Some WebKit versions hang forever on .play() with NO src at
-// all, instead of properly rejecting.
+// A tiny valid (silent) WAV — fallback only, in case the real confirmation
+// clip below ever fails to load. Some WebKit versions hang forever on
+// .play() with NO src at all, instead of properly rejecting.
 const SILENT_AUDIO = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+// Pre-generated "Monitoring started" clip, bundled as a static file so it
+// plays instantly with no backend round trip — works even if the backend
+// is still cold-starting right when someone needs it most. Also doubles as
+// the iOS audio-unlock: playing this real clip inside the click handler
+// unlocks this SAME <audio> element for later timer-triggered playback too.
+const START_CONFIRMATION_AUDIO = "monitoring-started.mp3";
 
 // Race any promise against a timeout so a hung native promise (seen on iOS
 // with Wake Lock and empty-source audio) can never block the app forever.
@@ -80,6 +88,102 @@ function withTimeout(promise, ms) {
     new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), ms))
   ]);
 }
+
+// --- Accessible triggers for "Describe Surroundings" ---
+// A blind user can't aim for a small labeled button. Two gesture-based
+// triggers work without needing to see or precisely target anything:
+// shaking the device, and double-tapping ANYWHERE on the screen. The
+// visible button stays too (handy for sighted testing/demoing) but is no
+// longer the only way in.
+
+let lastAcceleration = null;
+let shakePeakTimes = [];       // timestamps of recent large jolts
+let lastShakeTriggerTime = 0;
+const SHAKE_DELTA_THRESHOLD = 18;   // tune against real-world walking jostle
+const SHAKE_PEAK_WINDOW_MS = 800;   // peaks must land within this window of each other
+const SHAKE_REQUIRED_PEAKS = 3;     // this many jolts in the window = a deliberate shake,
+                                     // not a single bump from a curb or hard step
+const SHAKE_COOLDOWN_MS = 2500;     // minimum gap between two separate shake triggers
+
+function handleMotion(event) {
+  const acc = event.accelerationIncludingGravity || event.acceleration;
+  if (!acc || acc.x === null) return;
+
+  if (lastAcceleration) {
+    const delta =
+      Math.abs(acc.x - lastAcceleration.x) +
+      Math.abs(acc.y - lastAcceleration.y) +
+      Math.abs(acc.z - lastAcceleration.z);
+
+    const now = Date.now();
+
+    if (delta > SHAKE_DELTA_THRESHOLD) {
+      // A real shake is several sharp reversals in quick succession, not
+      // one jolt — so require SHAKE_REQUIRED_PEAKS of them within the
+      // window before treating it as intentional. Drop stale peaks first.
+      shakePeakTimes = shakePeakTimes.filter(t => now - t < SHAKE_PEAK_WINDOW_MS);
+      shakePeakTimes.push(now);
+
+      if (
+        shakePeakTimes.length >= SHAKE_REQUIRED_PEAKS &&
+        now - lastShakeTriggerTime > SHAKE_COOLDOWN_MS &&
+        monitoring
+      ) {
+        lastShakeTriggerTime = now;
+        shakePeakTimes = [];
+        describeOnDemand();
+      }
+    }
+  }
+  lastAcceleration = acc;
+}
+
+async function enableShakeTrigger() {
+  if (typeof DeviceMotionEvent === "undefined") return;
+
+  try {
+    // iOS 13+ requires an explicit permission prompt, and it MUST be
+    // requested inside a direct user gesture (same rule as everything
+    // else on iOS we've already run into) — done here inside the Start
+    // Monitoring click handler. Timeboxed defensively, same as the other
+    // iOS permission prompts, in case it ever hangs instead of resolving.
+    if (typeof DeviceMotionEvent.requestPermission === "function") {
+      const result = await withTimeout(DeviceMotionEvent.requestPermission(), 3000);
+      if (result !== "granted") return;
+    }
+    window.addEventListener("devicemotion", handleMotion);
+  } catch (e) {
+    console.warn("Motion permission unavailable:", e);
+  }
+}
+
+let lastTapTime = 0;
+const DOUBLE_TAP_MAX_GAP_MS = 450;
+
+function handleGlobalTap(e) {
+  // Ignore taps on actual buttons — those already have their own handlers.
+  if (e.target.closest && e.target.closest("button")) return;
+
+  if (!monitoring) {
+    // Before monitoring starts, this is the ONLY thing a first tap needs to
+    // do — no button to locate. A single tap anywhere on the blank starting
+    // screen begins the walk.
+    startMonitoring();
+    return;
+  }
+
+  // Once already monitoring, require a double-tap (not single) so an
+  // incidental brush against the screen while walking doesn't keep
+  // triggering the detailed description.
+  const now = Date.now();
+  if (now - lastTapTime < DOUBLE_TAP_MAX_GAP_MS) {
+    lastTapTime = 0;
+    describeOnDemand();
+  } else {
+    lastTapTime = now;
+  }
+}
+document.addEventListener("click", handleGlobalTap);
 
 // Surface ANY error directly on-screen instead of failing silently,
 // since we can't easily see the console on a phone.
@@ -105,20 +209,32 @@ async function startMonitoring() {
     });
     video.srcObject = stream;
 
-    // Unlock audio playback for iOS Safari. This MUST happen synchronously
-    // inside this direct click handler (a real user gesture) — Safari then
-    // allows this SAME <audio> element to be played later from timers too.
+    // Play the "Monitoring started" confirmation. This MUST happen
+    // synchronously inside this direct click handler (a real user gesture)
+    // — Safari then allows this SAME <audio> element to be played later
+    // from timers too. This also gives audible confirmation the tap
+    // actually worked, which matters a lot when the person can't see the
+    // status text change.
     try {
-      ttsAudio.src = SILENT_AUDIO;
-      ttsAudio.muted = true;
-      await withTimeout(ttsAudio.play(), 1500);
-      ttsAudio.pause();
-      ttsAudio.currentTime = 0;
-      ttsAudio.muted = false;
+      ttsAudio.src = START_CONFIRMATION_AUDIO;
+      await withTimeout(ttsAudio.play(), 2000);
     } catch (e) {
-      console.warn("Audio unlock failed or timed out:", e);
-      ttsAudio.muted = false;
+      console.warn("Start confirmation audio failed, falling back to silent unlock:", e);
+      try {
+        ttsAudio.src = SILENT_AUDIO;
+        ttsAudio.muted = true;
+        await withTimeout(ttsAudio.play(), 1500);
+        ttsAudio.pause();
+        ttsAudio.currentTime = 0;
+        ttsAudio.muted = false;
+      } catch (e2) {
+        console.warn("Silent-audio unlock fallback also failed:", e2);
+      }
     }
+
+    // Ask for motion permission in the same user gesture as everything
+    // else, so shake-to-describe works for the rest of the session.
+    await enableShakeTrigger();
 
     // Reset debounce state on every fresh start
     lastSpokenText = null;
@@ -253,6 +369,10 @@ async function describeOnDemand() {
   }
   isBusy = true;
   statusEl.textContent = "Describing surroundings...";
+  // Best-effort acknowledgment that the gesture registered. iOS Safari
+  // doesn't support the Vibration API at all (silently no-ops), but this
+  // gives Android users instant confirmation while the request is in flight.
+  if (navigator.vibrate) navigator.vibrate(80);
 
   try {
     const blob = await captureFrameBlob(DETAIL_CAPTURE_MAX_DIM);
