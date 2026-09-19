@@ -29,7 +29,20 @@ const BASE_URL = "https://icane-hophacks-2026.onrender.com";
 const CLASSIFY_URL = BASE_URL + "/classify";
 const SPEAK_URL = BASE_URL + "/speak";
 const DETAILED_URL = BASE_URL + "/describe-detailed";
-const CAPTURE_INTERVAL_MS = 2000;
+
+// Floor between capture ticks. The loop no longer waits a fixed 2s
+// regardless of how fast the backend responds — it captures again
+// immediately after each response, only padded up to this floor if the
+// round trip was faster than that (keeps it from hammering the API
+// needlessly fast, while never adding idle wait on top of a slow response).
+const MIN_LOOP_GAP_MS = 400;
+
+// Smaller frames = faster upload + faster Gemini classification. 640px on
+// the long edge is plenty of detail for "is there an obstacle ahead."
+const LOOP_CAPTURE_MAX_DIM = 640;
+// The on-demand button is a single tap, not a repeated poll, so it's worth
+// spending a bit more time on a higher-res frame for a better description.
+const DETAIL_CAPTURE_MAX_DIM = 1024;
 
 // Hysteresis: speak the instant a hazard appears (safety first, no delay
 // engaging), but require this many consecutive "clear" reads in a row
@@ -45,7 +58,7 @@ const statusEl = document.getElementById("status");
 const ttsAudio = document.getElementById("ttsAudio");
 
 let stream = null;
-let loopTimer = null;
+let monitoring = false;
 let wakeLock = null;
 let isBusy = false;
 let currentAudioUrl = null;
@@ -119,7 +132,8 @@ async function startMonitoring() {
     detailBtn.style.display = "inline-block";
     statusEl.textContent = "Monitoring...";
 
-    loopTimer = setInterval(captureAndClassify, CAPTURE_INTERVAL_MS);
+    monitoring = true;
+    runLoop(); // fire and forget — runs until monitoring is set false
 
     if (navigator.wakeLock) {
       navigator.wakeLock.request("screen")
@@ -132,7 +146,7 @@ async function startMonitoring() {
 }
 
 function stopMonitoring() {
-  clearInterval(loopTimer);
+  monitoring = false;
   if (stream) stream.getTracks().forEach(track => track.stop());
   if (wakeLock) wakeLock.release();
   startBtn.style.display = "inline-block";
@@ -141,21 +155,38 @@ function stopMonitoring() {
   statusEl.textContent = "Stopped";
 }
 
-function captureFrameBlob() {
+function captureFrameBlob(maxDim) {
   return new Promise((resolve, reject) => {
     if (!video.videoWidth || !video.videoHeight) {
       reject(new Error("camera not ready"));
       return;
     }
+    const scale = Math.min(1, maxDim / Math.max(video.videoWidth, video.videoHeight));
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext("2d").drawImage(video, 0, 0);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
     canvas.toBlob(blob => {
       if (!blob) reject(new Error("frame capture failed"));
       else resolve(blob);
-    }, "image/jpeg", 0.8);
+    }, "image/jpeg", 0.7);
   });
+}
+
+// Runs capture+classify back-to-back for as long as monitoring is true,
+// padded up to MIN_LOOP_GAP_MS between ticks but never waiting longer than
+// that — so the loop runs as fast as the backend actually responds instead
+// of always waiting a fixed interval regardless of round-trip time.
+async function runLoop() {
+  while (monitoring) {
+    const tickStart = performance.now();
+    await captureAndClassify();
+    const elapsed = performance.now() - tickStart;
+    const remaining = MIN_LOOP_GAP_MS - elapsed;
+    if (remaining > 0) {
+      await new Promise(r => setTimeout(r, remaining));
+    }
+  }
 }
 
 // Continuous loop tick: cheap text-only classification, then decide
@@ -167,7 +198,7 @@ async function captureAndClassify() {
   try {
     let blob;
     try {
-      blob = await captureFrameBlob();
+      blob = await captureFrameBlob(LOOP_CAPTURE_MAX_DIM);
     } catch (e) {
       statusEl.textContent = "Waiting for camera...";
       return;
@@ -224,7 +255,7 @@ async function describeOnDemand() {
   statusEl.textContent = "Describing surroundings...";
 
   try {
-    const blob = await captureFrameBlob();
+    const blob = await captureFrameBlob(DETAIL_CAPTURE_MAX_DIM);
     const formData = new FormData();
     formData.append("photo", blob, "frame.jpg");
 
