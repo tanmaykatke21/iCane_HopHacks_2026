@@ -174,14 +174,26 @@ def find_nearest_poi(lat: float, lon: float, category: tuple, radius_m: int = 30
     );
     out center 20;
     """
-    resp = requests.post(
+    # The public Overpass API is a free shared service and can be slow or
+    # briefly unavailable (especially on hackathon weekends with lots of
+    # traffic). Try a couple of mirrors before giving up — if every mirror
+    # fails, return None so the caller falls back to plain place-name
+    # geocoding instead of hard-erroring the whole request.
+    overpass_urls = [
         "https://overpass-api.de/api/interpreter",
-        data={"data": query},
-        headers={"User-Agent": "WalkAssistCane-HopHacks2026/1.0 (hackathon project)"},
-        timeout=12,
-    )
-    resp.raise_for_status()
-    elements = resp.json().get("elements", [])
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+    headers = {"User-Agent": "WalkAssistCane-HopHacks2026/1.0 (hackathon project)"}
+    elements = []
+    for url in overpass_urls:
+        try:
+            resp = requests.post(url, data={"data": query}, headers=headers, timeout=15)
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            break
+        except requests.RequestException as e:
+            print(f"Overpass mirror {url} failed: {e}")
+            continue
 
     best = None
     best_dist = None
@@ -244,14 +256,27 @@ async def find_destination(query: str = Form(...), lat: float = Form(...), lon: 
             matched_category = category
             break
 
+    # If this was a "nearest X" category request and Overpass was down,
+    # geocode_place() falls back to a literal text search — which can match
+    # a same-named place anywhere on Earth (seen in testing: "nearest park"
+    # matched a business 5,800km away). A same-worded match that far away
+    # is worthless for "nearest", so treat it as not-found instead of
+    # confidently sending someone thousands of km in the wrong direction.
+    MAX_FALLBACK_DISTANCE_M = 50000  # 50km sanity ceiling for category fallback only
+
     try:
         result = None
+        used_category_fallback = False
         if matched_category:
             result = find_nearest_poi(lat, lon, matched_category)
+            if not result:
+                used_category_fallback = True
         if not result:
             result = geocode_place(query, lat, lon)
+        if used_category_fallback and result and result["distance_m"] > MAX_FALLBACK_DISTANCE_M:
+            result = None
         if not result:
-            return JSONResponse({"error": "Could not find that destination"}, status_code=404)
+            return JSONResponse({"error": "Could not find that destination nearby"}, status_code=404)
         return JSONResponse(result)
     except requests.RequestException as e:
         return JSONResponse({"error": f"Location lookup failed: {str(e)}"}, status_code=502)
