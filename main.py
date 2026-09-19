@@ -1,5 +1,6 @@
 import os
 import io
+import time
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
@@ -38,11 +39,25 @@ DETAILED_PROMPT = (
 
 def classify_image(image_bytes: bytes, prompt: str) -> str:
     image = Image.open(io.BytesIO(image_bytes))
-    response = gemini_client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=[image, prompt]
-    )
-    return response.text.strip()
+    # Gemini occasionally returns a transient 503 ("high demand ... usually
+    # temporary") — confirmed directly in testing. Retry once on the same
+    # model, then fall back to a different model tier before giving up,
+    # instead of hard-failing the whole hazard-detection request on a
+    # brief spike.
+    models_to_try = ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
+    last_error = None
+    for i, model_name in enumerate(models_to_try):
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[image, prompt]
+            )
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            if i < len(models_to_try) - 1:
+                time.sleep(1)
+    raise last_error
 
 
 def synthesize_speech(text: str) -> bytes:
