@@ -38,6 +38,20 @@ let wakeLock = null;
 let isBusy = false;
 let currentAudioUrl = null;
 
+// A tiny valid (silent) WAV, so priming .play() has an actual source to
+// work with. Some WebKit versions hang forever on .play() with NO src at
+// all, instead of properly rejecting.
+const SILENT_AUDIO = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+// Race any promise against a timeout so a hung native promise (seen on iOS
+// with Wake Lock and empty-source audio) can never block the app forever.
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), ms))
+  ]);
+}
+
 // Surface ANY error directly on-screen instead of failing silently,
 // since we can't easily see the console on a phone.
 window.addEventListener("error", (e) => {
@@ -59,13 +73,15 @@ async function startMonitoring() {
     // inside this direct click handler (a real user gesture) — Safari then
     // allows this SAME <audio> element to be played later from timers too.
     try {
+      ttsAudio.src = SILENT_AUDIO;
       ttsAudio.muted = true;
-      await ttsAudio.play();
+      await withTimeout(ttsAudio.play(), 1500);
       ttsAudio.pause();
       ttsAudio.currentTime = 0;
       ttsAudio.muted = false;
     } catch (e) {
-      console.warn("Audio unlock failed:", e);
+      console.warn("Audio unlock failed or timed out:", e);
+      ttsAudio.muted = false;
     }
 
     // Flip UI + start the loop FIRST. Wake Lock is best-effort and iOS
