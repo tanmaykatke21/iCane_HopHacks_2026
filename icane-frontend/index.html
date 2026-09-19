@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Walk-Assist Cane</title>
+<style>
+  body { font-family: -apple-system, sans-serif; text-align: center; background: #111; color: #fff; margin: 0; padding: 20px; }
+  video { width: 100%; max-width: 400px; border-radius: 12px; }
+  button { font-size: 20px; padding: 16px 32px; margin-top: 20px; border-radius: 12px; border: none; }
+  #startBtn { background: #2ecc71; color: white; }
+  #stopBtn { background: #e74c3c; color: white; }
+  #status { margin-top: 16px; font-size: 16px; color: #aaa; }
+</style>
+</head>
+<body>
+
+<video id="preview" autoplay playsinline muted></video>
+<br />
+<button id="startBtn">Start Monitoring</button>
+<button id="stopBtn" style="display:none;">Stop</button>
+<div id="status">Not started</div>
+
+<script>
+const BACKEND_URL = "https://icane-hophacks-2026.onrender.com/describe";
+const CAPTURE_INTERVAL_MS = 2000;
+
+const video = document.getElementById("preview");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const statusEl = document.getElementById("status");
+
+let stream = null;
+let loopTimer = null;
+let wakeLock = null;
+let isBusy = false; // prevents overlapping requests
+
+async function startMonitoring() {
+  try {
+    // 1. Get camera access (back camera preferred)
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" }
+    });
+    video.srcObject = stream;
+
+    // 2. Keep the screen awake
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+    } catch (e) {
+      console.warn("Wake Lock not available:", e);
+    }
+
+    startBtn.style.display = "none";
+    stopBtn.style.display = "inline-block";
+    statusEl.textContent = "Monitoring...";
+
+    // 3. Start the capture loop
+    loopTimer = setInterval(captureAndSend, CAPTURE_INTERVAL_MS);
+  } catch (err) {
+    statusEl.textContent = "Camera access failed: " + err.message;
+  }
+}
+
+function stopMonitoring() {
+  clearInterval(loopTimer);
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  if (wakeLock) wakeLock.release();
+  startBtn.style.display = "inline-block";
+  stopBtn.style.display = "none";
+  statusEl.textContent = "Stopped";
+}
+
+async function captureAndSend() {
+  if (isBusy) return; // skip this tick if the last request hasn't finished
+  isBusy = true;
+  statusEl.textContent = "Capturing...";
+
+  try {
+    // Draw the current video frame to a canvas
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+
+    // Convert canvas to a JPEG blob
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
+
+    // Send it to the backend
+    const formData = new FormData();
+    formData.append("photo", blob, "frame.jpg");
+
+    const response = await fetch(BACKEND_URL, { method: "POST", body: formData });
+    if (!response.ok) throw new Error("Backend error: " + response.status);
+
+    const audioBlob = await response.blob();
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    await audio.play();
+
+    statusEl.textContent = "Monitoring...";
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+  } finally {
+    isBusy = false;
+  }
+}
+
+startBtn.addEventListener("click", startMonitoring);
+stopBtn.addEventListener("click", stopMonitoring);
+</script>
+
+</body>
+</html>
