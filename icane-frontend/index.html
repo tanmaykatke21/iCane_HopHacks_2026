@@ -36,7 +36,11 @@ const DETAILED_URL = BASE_URL + "/describe-detailed";
 // immediately after each response, only padded up to this floor if the
 // round trip was faster than that (keeps it from hammering the API
 // needlessly fast, while never adding idle wait on top of a slow response).
-const MIN_LOOP_GAP_MS = 400;
+// Raised from 400ms after hitting Gemini free-tier rate limits (429s) during
+// testing — continuous polling that fast exceeds the free-tier RPM quota.
+// Reliability matters more than raw speed for the demo, so trading some
+// responsiveness for staying under the quota is the right call here.
+const MIN_LOOP_GAP_MS = 2500;
 
 // Smaller frames = faster upload + faster Gemini classification. 640px on
 // the long edge is plenty of detail for "is there an obstacle ahead."
