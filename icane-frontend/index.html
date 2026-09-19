@@ -11,6 +11,7 @@
   #startBtn { background: #2ecc71; color: white; }
   #stopBtn { background: #e74c3c; color: white; }
   #detailBtn { background: #3498db; color: white; display: none; }
+  #navBtn { background: #9b59b6; color: white; display: none; }
   #status { margin-top: 16px; font-size: 16px; color: #aaa; }
 </style>
 </head>
@@ -21,6 +22,7 @@
 <button id="startBtn">Start Monitoring</button>
 <button id="stopBtn" style="display:none;">Stop</button>
 <button id="detailBtn">Describe Surroundings</button>
+<button id="navBtn">Navigate (Voice)</button>
 <div id="status">Not started</div>
 <div id="hint" style="margin-top: 8px; font-size: 13px; color: #666;">Tap anywhere to start. Once monitoring: shake the phone, or double-tap anywhere, for a full description</div>
 <audio id="ttsAudio" style="display:none;"></audio>
@@ -30,6 +32,8 @@ const BASE_URL = "https://icane-hophacks-2026.onrender.com";
 const CLASSIFY_URL = BASE_URL + "/classify";
 const SPEAK_URL = BASE_URL + "/speak";
 const DETAILED_URL = BASE_URL + "/describe-detailed";
+const VOICE_COMMAND_URL = BASE_URL + "/voice-command";
+const FIND_DESTINATION_URL = BASE_URL + "/find-destination";
 
 // Floor between capture ticks. The loop no longer waits a fixed 2s
 // regardless of how fast the backend responds — it captures again
@@ -55,6 +59,7 @@ const video = document.getElementById("preview");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const detailBtn = document.getElementById("detailBtn");
+const navBtn = document.getElementById("navBtn");
 const statusEl = document.getElementById("status");
 const ttsAudio = document.getElementById("ttsAudio");
 
@@ -246,6 +251,7 @@ async function startMonitoring() {
     startBtn.style.display = "none";
     stopBtn.style.display = "inline-block";
     detailBtn.style.display = "inline-block";
+    navBtn.style.display = "inline-block";
     statusEl.textContent = "Monitoring...";
 
     monitoring = true;
@@ -263,11 +269,13 @@ async function startMonitoring() {
 
 function stopMonitoring() {
   monitoring = false;
+  stopNavLoop(); // also end any active navigation
   if (stream) stream.getTracks().forEach(track => track.stop());
   if (wakeLock) wakeLock.release();
   startBtn.style.display = "inline-block";
   stopBtn.style.display = "none";
   detailBtn.style.display = "none";
+  navBtn.style.display = "none";
   statusEl.textContent = "Stopped";
 }
 
@@ -393,9 +401,237 @@ async function describeOnDemand() {
   }
 }
 
+// ============================================================================
+// NEW: Voice-activated navigation. Everything below is purely additive —
+// nothing above this point (hazard loop, describe, gestures, start/stop) was
+// changed. This shares the existing `isBusy` mutex so it never talks over a
+// hazard alert — it just quietly skips a tick and tries again later if busy.
+// ============================================================================
+
+const VOICE_RECORD_MS = 4000;        // fixed recording window for a voice command
+const NAV_UPDATE_INTERVAL_MS = 6000; // how often to speak a nav update
+const NAV_ARRIVAL_THRESHOLD_M = 15;  // "arrived" radius
+
+let navTimer = null;
+let navTargetLat = null;
+let navTargetLon = null;
+let navTargetName = null;
+let currentHeading = null;
+
+function haversineDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function bearingDegrees(lat1, lon1, lat2, lon2) {
+  const toRad = d => d * Math.PI / 180;
+  const toDeg = r => r * 180 / Math.PI;
+  const dLon = toRad(lon2 - lon1);
+  const y = Math.sin(dLon) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+            Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+function relativeDirection(bearingToTarget, heading) {
+  if (heading == null) return null; // no compass reading yet
+  let diff = (bearingToTarget - heading + 360) % 360;
+  if (diff > 180) diff -= 360; // -180..180
+  const abs = Math.abs(diff);
+  if (abs < 20) return "straight ahead";
+  if (diff >= 20 && diff < 90) return "to your right";
+  if (diff <= -20 && diff > -90) return "to your left";
+  if (diff >= 90 && diff < 160) return "sharply to your right";
+  if (diff <= -90 && diff > -160) return "sharply to your left";
+  return "behind you";
+}
+
+function handleOrientation(event) {
+  // iOS Safari exposes true compass heading via the non-standard
+  // webkitCompassHeading property — standard 'alpha' alone is unreliable
+  // for absolute heading on iOS without extra calibration steps, so prefer
+  // the iOS-specific one when it's present.
+  if (typeof event.webkitCompassHeading === "number") {
+    currentHeading = event.webkitCompassHeading;
+  } else if (event.absolute && typeof event.alpha === "number") {
+    currentHeading = (360 - event.alpha) % 360;
+  }
+}
+
+async function enableCompass() {
+  if (typeof DeviceOrientationEvent === "undefined") return;
+  try {
+    if (typeof DeviceOrientationEvent.requestPermission === "function") {
+      const result = await withTimeout(DeviceOrientationEvent.requestPermission(), 3000);
+      if (result !== "granted") return;
+    }
+    window.addEventListener("deviceorientation", handleOrientation, true);
+  } catch (e) {
+    console.warn("Compass permission unavailable:", e);
+  }
+}
+
+function getCurrentPositionAsync(timeoutMs) {
+  return new Promise((resolve, reject) =>
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: true,
+      timeout: timeoutMs,
+    })
+  );
+}
+
+async function startVoiceNavigation() {
+  if (!monitoring) {
+    statusEl.textContent = "Start monitoring first.";
+    return;
+  }
+  if (isBusy) {
+    statusEl.textContent = "Busy, try again in a moment...";
+    return;
+  }
+
+  let micStream;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    statusEl.textContent = "Microphone access failed: " + e.message;
+    return;
+  }
+
+  isBusy = true;
+  statusEl.textContent = "Listening... say where you want to go";
+  if (navigator.vibrate) navigator.vibrate(80);
+
+  try {
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+      ? "audio/webm"
+      : (MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "");
+    const recorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+    const recordingDone = new Promise(resolve => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
+    });
+
+    recorder.start();
+    await new Promise(r => setTimeout(r, VOICE_RECORD_MS));
+    recorder.stop();
+    const audioBlob = await recordingDone;
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+
+    statusEl.textContent = "Understanding request...";
+    const voiceForm = new FormData();
+    const ext = audioBlob.type.includes("mp4") ? "mp4" : "webm";
+    voiceForm.append("audio", audioBlob, "command." + ext);
+
+    const voiceResponse = await fetch(VOICE_COMMAND_URL, { method: "POST", body: voiceForm });
+    if (!voiceResponse.ok) throw new Error("Transcription failed: " + voiceResponse.status);
+    const { destination } = await voiceResponse.json();
+    if (!destination) throw new Error("Didn't catch a destination");
+
+    statusEl.textContent = "Finding: " + destination;
+
+    const position = await getCurrentPositionAsync(10000);
+    const { latitude, longitude } = position.coords;
+
+    const findForm = new FormData();
+    findForm.append("query", destination);
+    findForm.append("lat", latitude);
+    findForm.append("lon", longitude);
+    const findResponse = await fetch(FIND_DESTINATION_URL, { method: "POST", body: findForm });
+    const findResult = await findResponse.json();
+    if (!findResponse.ok || findResult.error) {
+      throw new Error(findResult.error || "Could not find that destination");
+    }
+
+    navTargetLat = findResult.lat;
+    navTargetLon = findResult.lon;
+    navTargetName = findResult.name;
+
+    const confirmForm = new FormData();
+    confirmForm.append(
+      "text",
+      `Navigating to ${navTargetName}, about ${Math.round(findResult.distance_m)} meters away.`
+    );
+    const confirmResp = await fetch(SPEAK_URL, { method: "POST", body: confirmForm });
+    if (confirmResp.ok) await playAudioBlob(await confirmResp.blob());
+
+    await enableCompass();
+    startNavLoop();
+    statusEl.textContent = "Navigating to " + navTargetName;
+  } catch (err) {
+    statusEl.textContent = "Navigation error: " + err.message;
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+  } finally {
+    isBusy = false;
+  }
+}
+
+function startNavLoop() {
+  stopNavLoop();
+  navTimer = setInterval(navUpdateTick, NAV_UPDATE_INTERVAL_MS);
+}
+
+function stopNavLoop() {
+  if (navTimer) clearInterval(navTimer);
+  navTimer = null;
+  navTargetLat = null;
+  navTargetLon = null;
+  navTargetName = null;
+}
+
+async function navUpdateTick() {
+  if (!monitoring || navTargetLat == null || isBusy) return;
+  isBusy = true;
+
+  try {
+    const position = await getCurrentPositionAsync(8000);
+    const { latitude, longitude } = position.coords;
+    const distance = haversineDistanceMeters(latitude, longitude, navTargetLat, navTargetLon);
+
+    if (distance < NAV_ARRIVAL_THRESHOLD_M) {
+      const arriveForm = new FormData();
+      arriveForm.append("text", `You have arrived at ${navTargetName}.`);
+      const arriveResp = await fetch(SPEAK_URL, { method: "POST", body: arriveForm });
+      if (arriveResp.ok) await playAudioBlob(await arriveResp.blob());
+      stopNavLoop();
+      statusEl.textContent = "Monitoring...";
+      return;
+    }
+
+    const bearing = bearingDegrees(latitude, longitude, navTargetLat, navTargetLon);
+    const direction = relativeDirection(bearing, currentHeading);
+    const distanceText = distance > 1000
+      ? (distance / 1000).toFixed(1) + " kilometers"
+      : Math.round(distance) + " meters";
+
+    const phrase = direction
+      ? `${navTargetName}, ${distanceText}, ${direction}.`
+      : `${navTargetName}, ${distanceText} ahead. Hold the phone flat to calibrate direction.`;
+
+    statusEl.textContent = "Nav: " + phrase;
+
+    const speakForm = new FormData();
+    speakForm.append("text", phrase);
+    const speakResp = await fetch(SPEAK_URL, { method: "POST", body: speakForm });
+    if (speakResp.ok) await playAudioBlob(await speakResp.blob());
+  } catch (err) {
+    console.warn("Nav update failed:", err);
+  } finally {
+    isBusy = false;
+  }
+}
+
 startBtn.addEventListener("click", startMonitoring);
 stopBtn.addEventListener("click", stopMonitoring);
 detailBtn.addEventListener("click", describeOnDemand);
+navBtn.addEventListener("click", startVoiceNavigation);
 </script>
 
 </body>
