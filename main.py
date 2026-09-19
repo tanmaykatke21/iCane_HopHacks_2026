@@ -1,8 +1,8 @@
 import os
 import io
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image
@@ -12,10 +12,9 @@ load_dotenv()
 
 app = FastAPI()
 
-# Allow your frontend to call this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # fine for a hackathon; tighten to your actual frontend URL later if you want
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,33 +29,72 @@ HAZARD_PROMPT = (
     "in one short, clear sentence. If the path is clear, respond with exactly: CLEAR."
 )
 
+DETAILED_PROMPT = (
+    "You are helping a blind or low-vision person understand their surroundings. "
+    "Describe the scene ahead in 2-3 clear sentences: general layout, notable objects, "
+    "people, and any hazards, with rough distances if you can judge them."
+)
+
+
+def classify_image(image_bytes: bytes, prompt: str) -> str:
+    image = Image.open(io.BytesIO(image_bytes))
+    response = gemini_client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=[image, prompt]
+    )
+    return response.text.strip()
+
+
+def synthesize_speech(text: str) -> bytes:
+    audio_chunks = eleven_client.text_to_speech.convert(
+        text=text,
+        voice_id="JBFqnCBsd6RMkjVDRZzb",
+        model_id="eleven_v3",
+        output_format="mp3_44100_128"
+    )
+    return b"".join(audio_chunks)
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+# Original combined endpoint — kept as-is so nothing that already depends on
+# it breaks. The continuous monitoring loop no longer uses this directly.
 @app.post("/describe")
 async def describe(photo: UploadFile = File(...)):
-    # 1. Read the uploaded photo
     image_bytes = await photo.read()
-    image = Image.open(io.BytesIO(image_bytes))
+    description = classify_image(image_bytes, HAZARD_PROMPT)
+    audio_bytes = synthesize_speech(description)
+    return Response(content=audio_bytes, media_type="audio/mpeg")
 
-    # 2. Ask Gemini to describe hazards
-    response = gemini_client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=[image, HAZARD_PROMPT]
-    )
-    description = response.text.strip()
 
-    # 3. Convert the description to speech
-    audio_chunks = eleven_client.text_to_speech.convert(
-        text=description,
-        voice_id="JBFqnCBsd6RMkjVDRZzb",  # "George"
-        model_id="eleven_v3",
-        output_format="mp3_44100_128"
-    )
-    audio_bytes = b"".join(audio_chunks)
+# Fast, text-only classification — no ElevenLabs call, so this is cheap and
+# quick enough to poll every ~2 seconds. The frontend uses this for the
+# continuous loop and decides client-side whether the result is worth
+# actually speaking out loud.
+@app.post("/classify")
+async def classify(photo: UploadFile = File(...)):
+    image_bytes = await photo.read()
+    description = classify_image(image_bytes, HAZARD_PROMPT)
+    return JSONResponse({"description": description})
 
-    # 4. Return the audio directly
+
+# Given text, returns spoken audio. Called only when the frontend's debounce
+# logic decides a change is actually worth announcing.
+@app.post("/speak")
+async def speak(text: str = Form(...)):
+    audio_bytes = synthesize_speech(text)
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
+# On-demand "describe my surroundings" trigger — a fuller description than
+# the one-line hazard alert, always spoken immediately regardless of the
+# debounce state, since it's an explicit user request.
+@app.post("/describe-detailed")
+async def describe_detailed(photo: UploadFile = File(...)):
+    image_bytes = await photo.read()
+    description = classify_image(image_bytes, DETAILED_PROMPT)
+    audio_bytes = synthesize_speech(description)
     return Response(content=audio_bytes, media_type="audio/mpeg")
