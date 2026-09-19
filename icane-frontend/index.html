@@ -7,9 +7,10 @@
 <style>
   body { font-family: -apple-system, sans-serif; text-align: center; background: #111; color: #fff; margin: 0; padding: 20px; }
   video { width: 100%; max-width: 400px; border-radius: 12px; }
-  button { font-size: 20px; padding: 16px 32px; margin-top: 20px; border-radius: 12px; border: none; }
+  button { font-size: 20px; padding: 16px 32px; margin-top: 20px; margin-right: 8px; border-radius: 12px; border: none; }
   #startBtn { background: #2ecc71; color: white; }
   #stopBtn { background: #e74c3c; color: white; }
+  #detailBtn { background: #3498db; color: white; display: none; }
   #status { margin-top: 16px; font-size: 16px; color: #aaa; }
 </style>
 </head>
@@ -19,16 +20,27 @@
 <br />
 <button id="startBtn">Start Monitoring</button>
 <button id="stopBtn" style="display:none;">Stop</button>
+<button id="detailBtn">Describe Surroundings</button>
 <div id="status">Not started</div>
 <audio id="ttsAudio" style="display:none;"></audio>
 
 <script>
-const BACKEND_URL = "https://icane-hophacks-2026.onrender.com/describe";
+const BASE_URL = "https://icane-hophacks-2026.onrender.com";
+const CLASSIFY_URL = BASE_URL + "/classify";
+const SPEAK_URL = BASE_URL + "/speak";
+const DETAILED_URL = BASE_URL + "/describe-detailed";
 const CAPTURE_INTERVAL_MS = 2000;
+
+// Hysteresis: speak the instant a hazard appears (safety first, no delay
+// engaging), but require this many consecutive "clear" reads in a row
+// before re-arming — so a single flickery misclassified frame in the
+// middle of a real hazard can't cause a spurious repeat or an early drop.
+const DISENGAGE_THRESHOLD = 2;
 
 const video = document.getElementById("preview");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
+const detailBtn = document.getElementById("detailBtn");
 const statusEl = document.getElementById("status");
 const ttsAudio = document.getElementById("ttsAudio");
 
@@ -37,6 +49,10 @@ let loopTimer = null;
 let wakeLock = null;
 let isBusy = false;
 let currentAudioUrl = null;
+
+// Debounce state
+let lastSpokenText = null;   // the hazard text we last actually spoke, or null when clear/silent
+let consecutiveClearCount = 0;
 
 // A tiny valid (silent) WAV, so priming .play() has an actual source to
 // work with. Some WebKit versions hang forever on .play() with NO src at
@@ -62,6 +78,13 @@ window.addEventListener("unhandledrejection", (e) => {
   statusEl.textContent = "PROMISE ERROR: " + msg;
 });
 
+async function playAudioBlob(audioBlob) {
+  if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+  currentAudioUrl = URL.createObjectURL(audioBlob);
+  ttsAudio.src = currentAudioUrl;
+  await ttsAudio.play();
+}
+
 async function startMonitoring() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -84,14 +107,19 @@ async function startMonitoring() {
       ttsAudio.muted = false;
     }
 
+    // Reset debounce state on every fresh start
+    lastSpokenText = null;
+    consecutiveClearCount = 0;
+
     // Flip UI + start the loop FIRST. Wake Lock is best-effort and iOS
     // Safari has a known bug where this promise can hang forever without
     // ever resolving or rejecting — never let it block startup.
     startBtn.style.display = "none";
     stopBtn.style.display = "inline-block";
+    detailBtn.style.display = "inline-block";
     statusEl.textContent = "Monitoring...";
 
-    loopTimer = setInterval(captureAndSend, CAPTURE_INTERVAL_MS);
+    loopTimer = setInterval(captureAndClassify, CAPTURE_INTERVAL_MS);
 
     if (navigator.wakeLock) {
       navigator.wakeLock.request("screen")
@@ -109,49 +137,102 @@ function stopMonitoring() {
   if (wakeLock) wakeLock.release();
   startBtn.style.display = "inline-block";
   stopBtn.style.display = "none";
+  detailBtn.style.display = "none";
   statusEl.textContent = "Stopped";
 }
 
-async function captureAndSend() {
-  if (isBusy) return;
-
-  // Video metadata (dimensions) can take an extra beat to arrive on iOS.
-  // Skip this tick rather than capturing a 0x0 frame.
-  if (!video.videoWidth || !video.videoHeight) {
-    statusEl.textContent = "Waiting for camera...";
-    return;
-  }
-
-  isBusy = true;
-  statusEl.textContent = "Capturing...";
-
-  try {
+function captureFrameBlob() {
+  return new Promise((resolve, reject) => {
+    if (!video.videoWidth || !video.videoHeight) {
+      reject(new Error("camera not ready"));
+      return;
+    }
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext("2d").drawImage(video, 0, 0);
+    canvas.toBlob(blob => {
+      if (!blob) reject(new Error("frame capture failed"));
+      else resolve(blob);
+    }, "image/jpeg", 0.8);
+  });
+}
 
-    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.8));
+// Continuous loop tick: cheap text-only classification, then decide
+// client-side whether this is worth actually speaking.
+async function captureAndClassify() {
+  if (isBusy) return;
+  isBusy = true;
 
-    if (!blob) {
-      statusEl.textContent = "Frame capture failed, retrying...";
-      isBusy = false;
+  try {
+    let blob;
+    try {
+      blob = await captureFrameBlob();
+    } catch (e) {
+      statusEl.textContent = "Waiting for camera...";
       return;
     }
 
     const formData = new FormData();
     formData.append("photo", blob, "frame.jpg");
 
-    const response = await fetch(BACKEND_URL, { method: "POST", body: formData });
+    const response = await fetch(CLASSIFY_URL, { method: "POST", body: formData });
+    if (!response.ok) throw new Error("Backend error: " + response.status);
+
+    const { description } = await response.json();
+    const isHazard = description.trim().toUpperCase() !== "CLEAR";
+
+    if (isHazard) {
+      consecutiveClearCount = 0;
+
+      // Only speak if this is a genuinely new/changed hazard, not a repeat
+      // of the exact thing we already just said.
+      if (description !== lastSpokenText) {
+        lastSpokenText = description;
+        statusEl.textContent = "Hazard: " + description;
+        const speakForm = new FormData();
+        speakForm.append("text", description);
+        const speakResponse = await fetch(SPEAK_URL, { method: "POST", body: speakForm });
+        if (speakResponse.ok) {
+          const audioBlob = await speakResponse.blob();
+          await playAudioBlob(audioBlob);
+        }
+      }
+    } else {
+      consecutiveClearCount++;
+      if (consecutiveClearCount >= DISENGAGE_THRESHOLD) {
+        // Re-arm: if the same hazard shows up again later, it's worth
+        // announcing again.
+        lastSpokenText = null;
+      }
+      statusEl.textContent = "Monitoring... (clear)";
+    }
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+  } finally {
+    isBusy = false;
+  }
+}
+
+// On-demand: explicit tap always speaks immediately, bypassing debounce.
+async function describeOnDemand() {
+  if (isBusy) {
+    statusEl.textContent = "Busy, try again in a moment...";
+    return;
+  }
+  isBusy = true;
+  statusEl.textContent = "Describing surroundings...";
+
+  try {
+    const blob = await captureFrameBlob();
+    const formData = new FormData();
+    formData.append("photo", blob, "frame.jpg");
+
+    const response = await fetch(DETAILED_URL, { method: "POST", body: formData });
     if (!response.ok) throw new Error("Backend error: " + response.status);
 
     const audioBlob = await response.blob();
-
-    if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
-    currentAudioUrl = URL.createObjectURL(audioBlob);
-
-    ttsAudio.src = currentAudioUrl;
-    await ttsAudio.play();
+    await playAudioBlob(audioBlob);
 
     statusEl.textContent = "Monitoring...";
   } catch (err) {
@@ -163,6 +244,7 @@ async function captureAndSend() {
 
 startBtn.addEventListener("click", startMonitoring);
 stopBtn.addEventListener("click", stopMonitoring);
+detailBtn.addEventListener("click", describeOnDemand);
 </script>
 
 </body>
