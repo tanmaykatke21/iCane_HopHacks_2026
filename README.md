@@ -183,4 +183,4 @@ That's on top of the one-time ~$15 hardware cost — still far cheaper than most
 
 ## Team
 
-Built at HopHacks Fall 2026 at Johns Hopkins University by Tanmay, Abhishek, Yakshil, and Abigail.
+Built at HopHacks Fall 2026 at Johns Hopkins University by Tanmay Katke, Abhishek Thakkar, Yakshil Patel, and Abigail Chen.
