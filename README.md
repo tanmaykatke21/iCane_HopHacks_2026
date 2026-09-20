@@ -4,6 +4,12 @@ A phone-camera walk-assist cane that gives blind and low-vision users real-time 
 
 iCane turns a standard cane into a smart navigation aid by mounting a phone to the cane. The phone camera observes the path ahead, a vision model identifies relevant hazards, signs, and traffic signals, and text-to-speech delivers concise, actionable audio feedback — not just descriptions, but instructions on what to do.
 
+## Live Demo
+
+**[Try it here](https://icane-hophacks-2026-1.onrender.com)** — open it on a phone and grant camera, microphone, and motion permissions when prompted. Works best in Chrome on iOS or Android.
+
+> Note: the backend is hosted on Render's free tier, which spins down after inactivity — the first request after a while may take 30-60 seconds to wake up.
+
 ## How It Works
 
 1. Attach a phone to the cane with a simple clamp.
