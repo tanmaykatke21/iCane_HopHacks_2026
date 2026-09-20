@@ -25,16 +25,64 @@ gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 eleven_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
 
 HAZARD_PROMPT = (
-    "You are helping a blind or low-vision person walk safely. "
-    "Describe only hazards or obstacles directly in their path ahead, "
-    "in one short, clear sentence. If the path is clear, respond with exactly: CLEAR."
+    "You are helping a blind or low-vision person walk safely. Look at the "
+    "image and describe ONLY a hazard or obstacle directly in their path ahead.\n"
+    "Rules:\n"
+    "- Maximum 8 words.\n"
+    "- Start directly with the hazard, no preamble.\n"
+    "- Never say 'I see', 'I can see', 'based on the image', 'in this image', "
+    "or anything similar.\n"
+    "- No hedging words like 'appears to be' or 'possibly' — state it plainly.\n"
+    "- If there is no hazard, respond with exactly: CLEAR\n"
+    "Examples of correct output:\n"
+    "Trash can ahead on the left.\n"
+    "Person crossing your path.\n"
+    "Low branch overhead.\n"
+    "CLEAR"
 )
 
 DETAILED_PROMPT = (
     "You are helping a blind or low-vision person understand their surroundings. "
-    "Describe the scene ahead in 2-3 clear sentences: general layout, notable objects, "
-    "people, and any hazards, with rough distances if you can judge them."
+    "Describe the scene ahead in exactly 2-3 short sentences: general layout, "
+    "notable objects, people, and any hazards, with rough distances if you can "
+    "judge them.\n"
+    "Rules:\n"
+    "- Start directly with the description, no preamble.\n"
+    "- Never say 'I see', 'I can see', 'based on the image', 'in this image', "
+    "or anything similar.\n"
+    "- No hedging words like 'appears to be' or 'possibly' unless genuinely "
+    "uncertain.\n"
+    "- Be concrete and concise — every word should carry useful information."
 )
+
+# Backup filter in case Gemini adds preamble/filler despite the prompt rules
+# above — cheap insurance that costs nothing when the prompt already worked,
+# and quietly fixes it when it didn't.
+_FILLER_PREFIXES = [
+    "i can see that",
+    "i can see",
+    "i see that",
+    "i see",
+    "based on the image,",
+    "based on the image",
+    "in this image,",
+    "in this image",
+    "looking at the image,",
+    "looking at the image",
+    "the image shows",
+]
+
+
+def strip_filler(text: str) -> str:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    for phrase in _FILLER_PREFIXES:
+        if lowered.startswith(phrase):
+            stripped = stripped[len(phrase):].lstrip(" ,:-—")
+            if stripped:
+                stripped = stripped[0].upper() + stripped[1:]
+            break
+    return stripped
 
 
 def classify_image(image_bytes: bytes, prompt: str) -> str:
@@ -52,7 +100,7 @@ def classify_image(image_bytes: bytes, prompt: str) -> str:
                 model=model_name,
                 contents=[image, prompt]
             )
-            return response.text.strip()
+            return strip_filler(response.text.strip())
         except Exception as e:
             last_error = e
             if i < len(models_to_try) - 1:
